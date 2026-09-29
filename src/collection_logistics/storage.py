@@ -50,6 +50,7 @@ CREATE TABLE IF NOT EXISTS road_corridors (
     origin_center_id TEXT NOT NULL REFERENCES response_centers(center_id),
     destination_center_id TEXT NOT NULL REFERENCES response_centers(center_id),
     preservation_resource_kind TEXT NOT NULL,
+    required_grade TEXT,
     hourly_capacity TEXT NOT NULL,
     delay_basis_points INTEGER NOT NULL,
     response_minutes INTEGER NOT NULL,
@@ -84,6 +85,8 @@ CREATE TABLE IF NOT EXISTS preservation_resource_lots (
     available_units TEXT NOT NULL,
     unit_cost_cny TEXT NOT NULL,
     received_at TEXT NOT NULL,
+    expires_at TEXT,
+    lot_status TEXT NOT NULL DEFAULT 'available' CHECK(lot_status IN ('available','frozen','depleted','expired')),
     revision INTEGER NOT NULL DEFAULT 1,
     created_by TEXT NOT NULL REFERENCES traffic_users(user_id),
     created_at TEXT NOT NULL
@@ -91,6 +94,9 @@ CREATE TABLE IF NOT EXISTS preservation_resource_lots (
 
 CREATE INDEX IF NOT EXISTS idx_inventory_available
 ON preservation_resource_lots(center_id, preservation_resource_kind, received_at);
+
+CREATE INDEX IF NOT EXISTS idx_inventory_candidates
+ON preservation_resource_lots(center_id, preservation_resource_kind, lot_status, expires_at);
 
 CREATE TABLE IF NOT EXISTS preservation_resource_adjustments (
     adjustment_id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -138,7 +144,6 @@ CREATE TABLE IF NOT EXISTS dispatch_plans (
 CREATE TABLE IF NOT EXISTS deployments (
     deployment_id TEXT PRIMARY KEY,
     dispatch_id TEXT NOT NULL UNIQUE REFERENCES dispatch_requests(dispatch_id),
-    inventory_preservation_resource_lot_id TEXT NOT NULL REFERENCES preservation_resource_lots(preservation_resource_lot_id),
     deployed_units TEXT NOT NULL,
     expected_arrived_units TEXT NOT NULL,
     departed_at TEXT NOT NULL,
@@ -148,6 +153,16 @@ CREATE TABLE IF NOT EXISTS deployments (
     created_by TEXT NOT NULL REFERENCES traffic_users(user_id),
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS deployment_lot_items (
+    deployment_id TEXT NOT NULL REFERENCES deployments(deployment_id),
+    preservation_resource_lot_id TEXT NOT NULL REFERENCES preservation_resource_lots(preservation_resource_lot_id),
+    allocated_units TEXT NOT NULL,
+    PRIMARY KEY(deployment_id, preservation_resource_lot_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_deployment_lot_items_lot
+ON deployment_lot_items(preservation_resource_lot_id);
 
 CREATE TABLE IF NOT EXISTS response_scenarios (
     scenario_id TEXT PRIMARY KEY,
@@ -208,7 +223,80 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 
 def initialize(connection: sqlite3.Connection) -> None:
+    _prepare_legacy_columns(connection)
     connection.executescript(SCHEMA)
+    _migrate_legacy_deployments(connection)
+
+
+def _table_exists(connection: sqlite3.Connection, table: str) -> bool:
+    return connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+    ).fetchone() is not None
+
+
+def _column_names(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _prepare_legacy_columns(connection: sqlite3.Connection) -> None:
+    """在执行新 SCHEMA 前，为早期数据库补齐有效期、可用状态和任务兼容等级列。
+
+    必须先补列，SCHEMA 中引用这些列的新索引才能在旧表上创建成功。
+    """
+    if _table_exists(connection, "preservation_resource_lots"):
+        lot_columns = _column_names(connection, "preservation_resource_lots")
+        if "expires_at" not in lot_columns:
+            connection.execute("ALTER TABLE preservation_resource_lots ADD COLUMN expires_at TEXT")
+        if "lot_status" not in lot_columns:
+            connection.execute(
+                "ALTER TABLE preservation_resource_lots ADD COLUMN lot_status TEXT NOT NULL DEFAULT 'available'"
+            )
+    if _table_exists(connection, "road_corridors"):
+        route_columns = _column_names(connection, "road_corridors")
+        if "required_grade" not in route_columns:
+            connection.execute("ALTER TABLE road_corridors ADD COLUMN required_grade TEXT")
+
+
+def _migrate_legacy_deployments(connection: sqlite3.Connection) -> None:
+    """把带人工点名列的旧出库单迁移到批次明细，并重建为不含该列的新结构。"""
+    if not _table_exists(connection, "deployments"):
+        return
+    deployment_columns = _column_names(connection, "deployments")
+    if "inventory_preservation_resource_lot_id" not in deployment_columns:
+        return
+    connection.execute(
+        "INSERT INTO deployment_lot_items(deployment_id,preservation_resource_lot_id,allocated_units) "
+        "SELECT deployment_id,inventory_preservation_resource_lot_id,deployed_units FROM deployments "
+        "WHERE inventory_preservation_resource_lot_id IS NOT NULL"
+    )
+    # deployment_lot_items 仍引用 deployments，重建父表期间需临时关闭外键强制。
+    foreign_keys = connection.execute("PRAGMA foreign_keys").fetchone()[0]
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        connection.executescript(
+            """
+            CREATE TABLE deployments_v2 (
+                deployment_id TEXT PRIMARY KEY,
+                dispatch_id TEXT NOT NULL UNIQUE REFERENCES dispatch_requests(dispatch_id),
+                deployed_units TEXT NOT NULL,
+                expected_arrived_units TEXT NOT NULL,
+                departed_at TEXT NOT NULL,
+                arrived_at TEXT,
+                state TEXT NOT NULL DEFAULT 'in_transit' CHECK(state IN ('in_transit','delivered','disputed')),
+                revision INTEGER NOT NULL DEFAULT 1,
+                created_by TEXT NOT NULL REFERENCES traffic_users(user_id),
+                created_at TEXT NOT NULL
+            );
+            INSERT INTO deployments_v2(deployment_id,dispatch_id,deployed_units,expected_arrived_units,
+                departed_at,arrived_at,state,revision,created_by,created_at)
+            SELECT deployment_id,dispatch_id,deployed_units,expected_arrived_units,departed_at,arrived_at,
+                state,revision,created_by,created_at FROM deployments;
+            DROP TABLE deployments;
+            ALTER TABLE deployments_v2 RENAME TO deployments;
+            """
+        )
+    finally:
+        connection.execute(f"PRAGMA foreign_keys={'ON' if foreign_keys else 'OFF'}")
 
 
 @contextmanager

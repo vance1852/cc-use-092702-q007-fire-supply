@@ -14,8 +14,9 @@ from .errors import ValidationFailed
 
 IDENTIFIER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.:-]{1,63}$")
 RISK_INDEXES = {"HUMIDITY", "INJURY", "CONGESTION", "HAZMAT", "SECONDARY", "CUSTOM"}
-RESOURCE_KINDS = {"preservation-box", "tow-truck", "ambulance", "warning-kit", "evidence-kit", "rapid-response-team"}
+RESOURCE_KINDS = {"preservation-box", "tow-truck", "ambulance", "warning-kit", "evidence-kit", "rapid-response-team", "water-bag"}
 CENTER_KINDS = {"road-section", "receiving-vault", "herbarium-room", "storage", "patrol-station"}
+LOT_STATUSES = {"available", "frozen", "depleted", "expired"}
 
 
 def required_text(value: object, field: str, maximum: int = 256) -> str:
@@ -130,6 +131,7 @@ class RoadCorridor:
     origin_center_id: str
     destination_center_id: str
     preservation_resource_kind: str
+    required_grade: str | None
     hourly_capacity: Decimal
     delay_basis_points: int
     response_minutes: int
@@ -138,7 +140,7 @@ class RoadCorridor:
     def from_dict(cls, raw: Mapping[str, Any]) -> "RoadCorridor":
         preservation_resource_kind = required_text(raw.get("preservation_resource_kind"), "preservation_resource_kind", 32)
         if preservation_resource_kind not in RESOURCE_KINDS:
-            raise ValidationFailed("preservation_resource_kind 不是受支持的电源类型")
+            raise ValidationFailed("preservation_resource_kind 不是受支持的资源类型")
         loss = raw.get("delay_basis_points", 0)
         if isinstance(loss, bool) or not isinstance(loss, int) or not 0 <= loss <= 1000:
             raise ValidationFailed("delay_basis_points 必须是 0 到 1000 的整数")
@@ -146,11 +148,16 @@ class RoadCorridor:
         destination = identifier(raw.get("destination_center_id"), "destination_center_id")
         if origin == destination:
             raise ValidationFailed("转运路线起点和终点不能相同")
+        required_grade_raw = raw.get("required_grade")
+        required_grade = None
+        if required_grade_raw is not None:
+            required_grade = required_text(required_grade_raw, "required_grade", 32).upper()
         return cls(
             corridor_id=identifier(raw.get("corridor_id"), "corridor_id"),
             origin_center_id=origin,
             destination_center_id=destination,
             preservation_resource_kind=preservation_resource_kind,
+            required_grade=required_grade,
             hourly_capacity=decimal_value(
                 raw.get("hourly_capacity"), "hourly_capacity", minimum=Decimal("0.001")
             ),
@@ -168,17 +175,29 @@ class PreservationResourceLot:
     quantity_units: Decimal
     unit_cost_cny: Decimal
     received_at: str
+    expires_at: str | None
+    lot_status: str
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "PreservationResourceLot":
         preservation_resource_kind = required_text(raw.get("preservation_resource_kind"), "preservation_resource_kind", 32)
         if preservation_resource_kind not in RESOURCE_KINDS:
-            raise ValidationFailed("preservation_resource_kind 不是受支持的电源类型")
+            raise ValidationFailed("preservation_resource_kind 不是受支持的资源类型")
         received_at = required_text(raw.get("received_at"), "received_at", 40)
         try:
             parse_utc(received_at, "received_at")
         except ValueError as exc:
             raise ValidationFailed(str(exc)) from exc
+        expires_at = None
+        if raw.get("expires_at") is not None:
+            expires_at = required_text(raw.get("expires_at"), "expires_at", 40)
+            try:
+                parse_utc(expires_at, "expires_at")
+            except ValueError as exc:
+                raise ValidationFailed(str(exc)) from exc
+        lot_status = str(raw.get("lot_status", "available")).strip().lower()
+        if lot_status not in LOT_STATUSES:
+            raise ValidationFailed("lot_status 必须是 available、frozen、depleted 或 expired")
         return cls(
             preservation_resource_lot_id=identifier(raw.get("preservation_resource_lot_id"), "preservation_resource_lot_id"),
             center_id=identifier(raw.get("center_id"), "center_id"),
@@ -191,6 +210,8 @@ class PreservationResourceLot:
                 raw.get("unit_cost_cny"), "unit_cost_cny", minimum=Decimal("0")
             ),
             received_at=received_at,
+            expires_at=expires_at,
+            lot_status=lot_status,
         )
 
 
@@ -218,6 +239,28 @@ class DispatchRequest:
                 raw.get("requested_units"), "requested_units", minimum=Decimal("0.001")
             ),
             priority=priority,
+            idempotency_key=identifier(raw.get("idempotency_key"), "idempotency_key"),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DeploymentConfirmation:
+    """防火办出库确认：只声明任务与幂等键，批次由系统按约束自动选择。"""
+
+    deployment_id: str
+    dispatch_id: str
+    expected_revision: int
+    idempotency_key: str
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "DeploymentConfirmation":
+        expected_revision = raw.get("expected_revision")
+        if isinstance(expected_revision, bool) or not isinstance(expected_revision, int) or expected_revision <= 0:
+            raise ValidationFailed("expected_revision 必须是正整数")
+        return cls(
+            deployment_id=identifier(raw.get("deployment_id"), "deployment_id"),
+            dispatch_id=identifier(raw.get("dispatch_id"), "dispatch_id"),
+            expected_revision=expected_revision,
             idempotency_key=identifier(raw.get("idempotency_key"), "idempotency_key"),
         )
 
