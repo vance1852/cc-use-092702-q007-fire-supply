@@ -16,6 +16,18 @@ class Conflict(CollectionDispatchError):
     status = 409
 
 
+class InventoryInsufficient(Conflict):
+    """所属站点该种类物资的物理库存无法满足申请数量。"""
+
+    code = "inventory_insufficient"
+
+
+class InventoryIncompatible(Conflict):
+    """站点虽有同种类库存，但批次不满足兼容等级、有效期或可用状态约束。"""
+
+    code = "inventory_incompatible"
+
+
 class Forbidden(CollectionDispatchError):
     code = "forbidden"
     status = 403

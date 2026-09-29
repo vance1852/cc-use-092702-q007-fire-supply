@@ -84,6 +84,8 @@ CREATE TABLE IF NOT EXISTS preservation_resource_lots (
     available_units TEXT NOT NULL,
     unit_cost_cny TEXT NOT NULL,
     received_at TEXT NOT NULL,
+    expires_on TEXT,
+    active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1)),
     revision INTEGER NOT NULL DEFAULT 1,
     created_by TEXT NOT NULL REFERENCES traffic_users(user_id),
     created_at TEXT NOT NULL
@@ -138,16 +140,33 @@ CREATE TABLE IF NOT EXISTS dispatch_plans (
 CREATE TABLE IF NOT EXISTS deployments (
     deployment_id TEXT PRIMARY KEY,
     dispatch_id TEXT NOT NULL UNIQUE REFERENCES dispatch_requests(dispatch_id),
-    inventory_preservation_resource_lot_id TEXT NOT NULL REFERENCES preservation_resource_lots(preservation_resource_lot_id),
+    required_grade TEXT,
     deployed_units TEXT NOT NULL,
     expected_arrived_units TEXT NOT NULL,
     departed_at TEXT NOT NULL,
     arrived_at TEXT,
     state TEXT NOT NULL DEFAULT 'in_transit' CHECK(state IN ('in_transit','delivered','disputed')),
     revision INTEGER NOT NULL DEFAULT 1,
+    idempotency_key TEXT NOT NULL UNIQUE,
     created_by TEXT NOT NULL REFERENCES traffic_users(user_id),
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS deployment_lot_items (
+    deployment_id TEXT NOT NULL REFERENCES deployments(deployment_id),
+    item_seq INTEGER NOT NULL,
+    preservation_resource_lot_id TEXT NOT NULL REFERENCES preservation_resource_lots(preservation_resource_lot_id),
+    center_id TEXT NOT NULL,
+    preservation_resource_kind TEXT NOT NULL,
+    grade TEXT NOT NULL,
+    units_allocated TEXT NOT NULL,
+    units_after_deduction TEXT NOT NULL,
+    expires_on TEXT,
+    PRIMARY KEY(deployment_id, item_seq)
+);
+
+CREATE INDEX IF NOT EXISTS idx_deployment_lot_items_lot
+ON deployment_lot_items(preservation_resource_lot_id);
 
 CREATE TABLE IF NOT EXISTS response_scenarios (
     scenario_id TEXT PRIMARY KEY,
@@ -209,6 +228,81 @@ def connect(path: str | Path) -> sqlite3.Connection:
 
 def initialize(connection: sqlite3.Connection) -> None:
     connection.executescript(SCHEMA)
+    _migrate(connection)
+
+
+def _columns(connection: sqlite3.Connection, table: str) -> set[str]:
+    return {row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()}
+
+
+def _migrate(connection: sqlite3.Connection) -> None:
+    """补齐旧库中新增的列与出库单结构。
+
+    重建 deployments 表时按 SQLite 官方建议临时关闭外键约束（该 PRAGMA 不能在
+    事务内切换），完成后立即 foreign_key_check，保证迁移不留悬空引用。
+    """
+    lot_columns = _columns(connection, "preservation_resource_lots")
+    lot_migrations = [
+        statement
+        for column, statement in (
+            ("expires_on", "ALTER TABLE preservation_resource_lots ADD COLUMN expires_on TEXT"),
+            ("active", "ALTER TABLE preservation_resource_lots ADD COLUMN active INTEGER NOT NULL DEFAULT 1"),
+        )
+        if column not in lot_columns
+    ]
+    if lot_migrations:
+        with transaction(connection):
+            for statement in lot_migrations:
+                connection.execute(statement)
+
+    deployment_columns = _columns(connection, "deployments")
+    if not deployment_columns or "idempotency_key" in deployment_columns:
+        return
+
+    connection.execute("PRAGMA foreign_keys=OFF")
+    try:
+        connection.execute("BEGIN")
+        try:
+            connection.execute(
+                "CREATE TABLE deployments_new ("
+                "deployment_id TEXT PRIMARY KEY,"
+                "dispatch_id TEXT NOT NULL UNIQUE REFERENCES dispatch_requests(dispatch_id),"
+                "required_grade TEXT,"
+                "deployed_units TEXT NOT NULL,"
+                "expected_arrived_units TEXT NOT NULL,"
+                "departed_at TEXT NOT NULL,"
+                "arrived_at TEXT,"
+                "state TEXT NOT NULL DEFAULT 'in_transit' CHECK(state IN ('in_transit','delivered','disputed')),"
+                "revision INTEGER NOT NULL DEFAULT 1,"
+                "idempotency_key TEXT NOT NULL UNIQUE,"
+                "created_by TEXT NOT NULL REFERENCES traffic_users(user_id),"
+                "created_at TEXT NOT NULL)"
+            )
+            connection.execute(
+                "INSERT INTO deployments_new(deployment_id,dispatch_id,deployed_units,expected_arrived_units,"
+                "departed_at,arrived_at,state,revision,idempotency_key,created_by,created_at) "
+                "SELECT deployment_id,dispatch_id,deployed_units,expected_arrived_units,departed_at,arrived_at,"
+                "state,revision,'legacy:'||deployment_id,created_by,created_at FROM deployments"
+            )
+            connection.execute(
+                "INSERT INTO deployment_lot_items(deployment_id,item_seq,preservation_resource_lot_id,center_id,"
+                "preservation_resource_kind,grade,units_allocated,units_after_deduction,expires_on) "
+                "SELECT d.deployment_id,1,d.inventory_preservation_resource_lot_id,l.center_id,l.preservation_resource_kind,"
+                "l.grade,d.deployed_units,l.available_units,l.expires_on "
+                "FROM deployments d LEFT JOIN preservation_resource_lots l "
+                "ON l.preservation_resource_lot_id=d.inventory_preservation_resource_lot_id"
+            )
+            connection.execute("DROP TABLE deployments")
+            connection.execute("ALTER TABLE deployments_new RENAME TO deployments")
+            connection.execute("COMMIT")
+        except BaseException:
+            connection.execute("ROLLBACK")
+            raise
+    finally:
+        connection.execute("PRAGMA foreign_keys=ON")
+    violations = connection.execute("PRAGMA foreign_key_check").fetchall()
+    if violations:
+        raise sqlite3.IntegrityError(f"迁移后存在悬空外键引用: {violations!r}")
 
 
 @contextmanager

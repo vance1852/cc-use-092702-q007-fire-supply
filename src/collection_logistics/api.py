@@ -76,7 +76,7 @@ class JsonApplication:
             if method == "POST" and len(parts) == 3 and parts[0] == "road_corridors" and parts[2] == "allocate":
                 return Response(200, self.service.allocate(actor, parts[1], payload["duty_date"]))
             if method == "POST" and path == "/deployments":
-                return Response(201, self.service.dispatch_deployment(actor, payload["deployment_id"], payload["dispatch_id"], payload["preservation_resource_lot_id"], int(payload["expected_revision"])))
+                return Response(201, self.service.confirm_deployment(actor, payload))
             if method == "POST" and path == "/scenarios":
                 return Response(201, self.service.create_scenario(actor, payload))
             if method == "POST" and len(parts) == 3 and parts[0] == "scenarios" and parts[2] == "approve":

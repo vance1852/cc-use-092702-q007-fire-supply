@@ -8,7 +8,7 @@ from decimal import Decimal
 
 from collection_logistics.api import JsonApplication
 from collection_logistics.clock import FrozenClock
-from collection_logistics.errors import Conflict, Forbidden
+from collection_logistics.errors import Conflict, Forbidden, InventoryIncompatible, InventoryInsufficient
 from collection_logistics.planning import AllocationRequest, RiskPoint, allocate_capacity, latest_streak
 from collection_logistics.service import CollectionLogisticsService
 from collection_logistics.risk import DemandBucket, inventory_coverage, mark_to_risk, traffic_gap
@@ -101,7 +101,7 @@ class CollectionLogisticsServiceTests(unittest.TestCase):
         self.assertEqual(allocation["available_units"], "50000.000")
         self.assertEqual(allocation["allocations"][1]["allocated_units"], "10000.000")
         self.service.add_inventory_lot("dispatch", {"preservation_resource_lot_id": "lot-1", "center_id": "collection-east", "preservation_resource_kind": "preservation-box", "grade": "HUMIDITY", "quantity_units": "60000", "unit_cost_cny": "91", "received_at": "2026-09-24T06:00:00Z"})
-        deployment = self.service.dispatch_deployment("dispatch", "deployment-1", "nom-1", "lot-1", 2)
+        deployment = self.service.confirm_deployment("dispatch", {"deployment_id": "deployment-1", "dispatch_id": "nom-1", "required_grade": "HUMIDITY", "idempotency_key": "deploy-key-1", "note": ""})
         self.assertEqual(deployment["deployed_units"], "40000.000")
         self.assertEqual(self.service.inventory_lot("lot-1")["available_units"], "20000.000")
 
@@ -122,6 +122,89 @@ class CollectionLogisticsServiceTests(unittest.TestCase):
         self.assertTrue(self.service.audit_chain("audit")["valid"])
         self.connection.execute("UPDATE traffic_audit_events SET payload_json='{}' WHERE event_id=1")
         self.assertFalse(self.service.audit_chain("audit")["valid"])
+
+    def _prepare_dispatch(self, requested: str = "40000", dispatch_id: str = "nom-east", key: str = "nom-east-key") -> None:
+        self.service.submit_dispatch("dispatch", {"dispatch_id": dispatch_id, "corridor_id": "transfer-east-1", "specimen_event_id": "fire-drill-east", "duty_date": "2026-09-25", "requested_units": requested, "priority": 10, "idempotency_key": key})
+        self.service.allocate("dispatch", "transfer-east-1", "2026-09-25")
+
+    def _lot(self, lot_id: str, center: str, grade: str, quantity: str, *, expires_on=None, active=True, received_at="2026-09-20T06:00:00Z") -> None:
+        payload = {"preservation_resource_lot_id": lot_id, "center_id": center, "preservation_resource_kind": "preservation-box", "grade": grade, "quantity_units": quantity, "unit_cost_cny": "91", "received_at": received_at, "active": active}
+        if expires_on is not None:
+            payload["expires_on"] = expires_on
+        self.service.add_inventory_lot("dispatch", payload)
+
+    def test_cross_station_lot_cannot_cover_east_shortage(self) -> None:
+        # 西部站有充足普通储水袋，但东部站账面为零：必须判库存不足，绝不允许跨站扣减。
+        self.service.create_facility("plan", {"center_id": "collection-west", "name": "西部保护站", "kind": "storage", "timezone": "Asia/Shanghai", "capacity_units": "500000"})
+        self._prepare_dispatch()
+        self._lot("lot-west", "collection-west", "HIGH-PRESSURE", "40000")
+        with self.assertRaises(InventoryInsufficient) as caught:
+            self.service.confirm_deployment("dispatch", {"deployment_id": "dep-1", "dispatch_id": "nom-east", "required_grade": "HIGH-PRESSURE", "idempotency_key": "dep-key-1", "note": ""})
+        self.assertEqual(caught.exception.code, "inventory_insufficient")
+        self.assertEqual(self.service.inventory_lot("lot-west")["available_units"], "40000")
+        rows = self.connection.execute("SELECT COUNT(*) c FROM traffic_audit_events WHERE event_type='deployment.dispatched'").fetchone()
+        self.assertEqual(rows["c"], 0)
+
+    def test_stock_present_but_grade_incompatible_is_distinct_reason(self) -> None:
+        # 东部站账面有货且物理可用，但只是普通储水袋，不适配高压水泵接口。
+        self._prepare_dispatch()
+        self._lot("lot-plain", "collection-east", "STANDARD", "40000")
+        with self.assertRaises(InventoryIncompatible) as caught:
+            self.service.confirm_deployment("dispatch", {"deployment_id": "dep-1", "dispatch_id": "nom-east", "required_grade": "HIGH-PRESSURE", "idempotency_key": "dep-key-1", "note": ""})
+        self.assertEqual(caught.exception.code, "inventory_incompatible")
+        self.assertIn("HIGH-PRESSURE", str(caught.exception))
+        self.assertEqual(self.service.inventory_lot("lot-plain")["available_units"], "40000")
+
+    def test_expired_and_inactive_lots_are_excluded(self) -> None:
+        self._prepare_dispatch()
+        self._lot("lot-expired", "collection-east", "HIGH-PRESSURE", "30000", expires_on="2026-09-10")
+        self._lot("lot-inactive", "collection-east", "HIGH-PRESSURE", "30000", active=False)
+        with self.assertRaises(InventoryIncompatible):
+            self.service.confirm_deployment("dispatch", {"deployment_id": "dep-1", "dispatch_id": "nom-east", "required_grade": "HIGH-PRESSURE", "idempotency_key": "dep-key-1", "note": ""})
+
+    def test_successful_confirmation_records_selection_operator_and_basis(self) -> None:
+        self._prepare_dispatch()
+        self._lot("lot-hp-1", "collection-east", "HIGH-PRESSURE", "40000", expires_on="2027-01-01")
+        result = self.service.confirm_deployment("dispatch", {"deployment_id": "dep-1", "dispatch_id": "nom-east", "required_grade": "HIGH-PRESSURE", "idempotency_key": "dep-key-1", "note": "防火演练"})
+        self.assertEqual(result["state"], "in_transit")
+        self.assertEqual(result["deployed_units"], "40000.000")
+        self.assertEqual(result["operator"]["user_id"], "dispatch")
+        self.assertEqual(len(result["selected_lots"]), 1)
+        chosen = result["selected_lots"][0]
+        self.assertEqual(chosen["preservation_resource_lot_id"], "lot-hp-1")
+        self.assertEqual(chosen["units_allocated"], "40000.000")
+        self.assertIn("grade=HIGH-PRESSURE", chosen["constraint_basis"])
+        self.assertIn("center=collection-east", chosen["constraint_basis"])
+        self.assertEqual(result["constraints"]["preservation_resource_kind"], "preservation-box")
+        self.assertEqual(self.service.inventory_lot("lot-hp-1")["available_units"], "0.000")
+        item = self.connection.execute("SELECT * FROM deployment_lot_items WHERE deployment_id='dep-1'").fetchone()
+        self.assertEqual(item["preservation_resource_lot_id"], "lot-hp-1")
+
+    def test_identical_request_replays_without_double_deduction(self) -> None:
+        self._prepare_dispatch()
+        self._lot("lot-hp-1", "collection-east", "HIGH-PRESSURE", "40000", expires_on="2027-01-01")
+        payload = {"deployment_id": "dep-1", "dispatch_id": "nom-east", "required_grade": "HIGH-PRESSURE", "idempotency_key": "dep-key-1", "note": "防火演练"}
+        first = self.service.confirm_deployment("dispatch", payload)
+        second = self.service.confirm_deployment("dispatch", payload)
+        self.assertEqual(first, second)
+        self.assertEqual(self.service.inventory_lot("lot-hp-1")["available_units"], "0.000")
+        deployments = self.connection.execute("SELECT COUNT(*) c FROM deployments").fetchone()["c"]
+        deductions = self.connection.execute("SELECT revision FROM preservation_resource_lots WHERE preservation_resource_lot_id='lot-hp-1'").fetchone()["revision"]
+        self.assertEqual(deployments, 1)
+        self.assertEqual(deductions, 2)
+        with self.assertRaises(Conflict):
+            self.service.confirm_deployment("dispatch", dict(payload, note="不同内容"))
+
+    def test_multi_lot_selection_uses_first_expiry_first_out(self) -> None:
+        self._prepare_dispatch(requested="50000")
+        self._lot("lot-later", "collection-east", "HIGH-PRESSURE", "30000", expires_on="2028-06-01", received_at="2026-09-20T06:00:00Z")
+        self._lot("lot-sooner", "collection-east", "HIGH-PRESSURE", "30000", expires_on="2027-06-01", received_at="2026-09-21T06:00:00Z")
+        result = self.service.confirm_deployment("dispatch", {"deployment_id": "dep-1", "dispatch_id": "nom-east", "required_grade": "HIGH-PRESSURE", "idempotency_key": "dep-key-1", "note": ""})
+        self.assertEqual([item["preservation_resource_lot_id"] for item in result["selected_lots"]], ["lot-sooner", "lot-later"])
+        self.assertEqual(result["selected_lots"][0]["units_allocated"], "30000.000")
+        self.assertEqual(result["selected_lots"][1]["units_allocated"], "20000.000")
+        self.assertEqual(self.service.inventory_lot("lot-sooner")["available_units"], "0.000")
+        self.assertEqual(self.service.inventory_lot("lot-later")["available_units"], "10000.000")
 
     def test_api_exposes_browser_free_boundary(self) -> None:
         app = JsonApplication(self.service)

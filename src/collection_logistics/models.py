@@ -168,6 +168,8 @@ class PreservationResourceLot:
     quantity_units: Decimal
     unit_cost_cny: Decimal
     received_at: str
+    expires_on: str | None
+    active: bool
 
     @classmethod
     def from_dict(cls, raw: Mapping[str, Any]) -> "PreservationResourceLot":
@@ -179,6 +181,11 @@ class PreservationResourceLot:
             parse_utc(received_at, "received_at")
         except ValueError as exc:
             raise ValidationFailed(str(exc)) from exc
+        expires_on_raw = raw.get("expires_on")
+        expires_on = None if expires_on_raw is None else date_text(expires_on_raw, "expires_on")
+        active = raw.get("active", True)
+        if not isinstance(active, bool):
+            raise ValidationFailed("active 必须是布尔值")
         return cls(
             preservation_resource_lot_id=identifier(raw.get("preservation_resource_lot_id"), "preservation_resource_lot_id"),
             center_id=identifier(raw.get("center_id"), "center_id"),
@@ -191,6 +198,34 @@ class PreservationResourceLot:
                 raw.get("unit_cost_cny"), "unit_cost_cny", minimum=Decimal("0")
             ),
             received_at=received_at,
+            expires_on=expires_on,
+            active=active,
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class DeploymentConfirmation:
+    """出库确认：系统按任务约束自行选择兼容批次，不接受调用方指定批次。"""
+
+    deployment_id: str
+    dispatch_id: str
+    required_grade: str | None
+    idempotency_key: str
+    note: str
+
+    @classmethod
+    def from_dict(cls, raw: Mapping[str, Any]) -> "DeploymentConfirmation":
+        required_grade_raw = raw.get("required_grade")
+        required_grade = None if required_grade_raw is None else required_text(required_grade_raw, "required_grade", 32).upper()
+        note_raw = raw.get("note", "")
+        if not isinstance(note_raw, str) or len(note_raw) > 512:
+            raise ValidationFailed("note 不能超过 512 个字符")
+        return cls(
+            deployment_id=identifier(raw.get("deployment_id"), "deployment_id"),
+            dispatch_id=identifier(raw.get("dispatch_id"), "dispatch_id"),
+            required_grade=required_grade,
+            idempotency_key=identifier(raw.get("idempotency_key"), "idempotency_key"),
+            note=note_raw.strip(),
         )
 
 
